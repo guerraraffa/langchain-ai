@@ -1510,6 +1510,8 @@ class SyncPregelLoop(PregelLoop, AbstractContextManager):
             if prev is not None:
                 prev.result()
         finally:
+            # Break the reference chain so previous checkpoint data can be GC'd.
+            del prev
             cast(BaseCheckpointSaver, self.checkpointer).put(
                 config, checkpoint, metadata, new_versions
             )
@@ -1764,6 +1766,8 @@ class AsyncPregelLoop(PregelLoop, AbstractAsyncContextManager):
             if prev is not None:
                 await prev
         finally:
+            # Break the reference chain so previous checkpoint data can be GC'd.
+            del prev
             await cast(BaseCheckpointSaver, self.checkpointer).aput(
                 config, checkpoint, metadata, new_versions
             )
