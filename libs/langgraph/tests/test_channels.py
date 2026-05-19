@@ -3,7 +3,12 @@ from collections.abc import Sequence
 from typing import Annotated
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    RemoveMessage,
+)
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from typing_extensions import NotRequired, TypedDict
@@ -16,7 +21,7 @@ from langgraph.channels.topic import Topic
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.errors import EmptyChannelError, InvalidUpdateError
 from langgraph.graph import START, StateGraph
-from langgraph.graph.message import _messages_delta_reducer
+from langgraph.graph.message import REMOVE_ALL_MESSAGES, _messages_delta_reducer
 from langgraph.graph.state import _get_channel
 from langgraph.types import Overwrite
 
@@ -282,6 +287,61 @@ def test_messages_delta_reducer_tuple_write_is_one_message() -> None:
     assert len(result) == 1
     assert isinstance(result[0], HumanMessage)
     assert result[0].content == "hi"
+
+
+def test_messages_delta_reducer_assigns_uuid_to_id_less_messages() -> None:
+    """Messages without IDs get UUIDs assigned, matching add_messages behavior.
+
+    Without UUID assignment, RemoveMessage tombstoning fails on messages that
+    were created without explicit IDs.
+    """
+    m1 = HumanMessage(content="hi")
+    m2 = AIMessage(content="hello")
+    assert m1.id is None
+    assert m2.id is None
+
+    result = _messages_delta_reducer([], [[m1, m2]])
+    assert len(result) == 2
+    assert result[0].id is not None
+    assert result[1].id is not None
+
+    # RemoveMessage tombstoning must work on the now-assigned IDs.
+    result2 = _messages_delta_reducer(result, [RemoveMessage(id=result[1].id)])
+    assert len(result2) == 1
+    assert result2[0].content == "hi"
+
+
+def test_messages_delta_reducer_remove_all_messages() -> None:
+    """REMOVE_ALL_MESSAGES sentinel clears all state and preceding writes."""
+    state = [HumanMessage(content="old", id="h1"), AIMessage(content="prior", id="a1")]
+
+    # Sentinel mid-batch: everything before it (including state) is discarded.
+    result = _messages_delta_reducer(
+        state,
+        [
+            [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                HumanMessage(content="fresh", id="h2"),
+            ]
+        ],
+    )
+    assert len(result) == 1
+    assert result[0].content == "fresh"
+
+    # Batching-invariant: split across two calls must equal one combined call.
+    step1 = _messages_delta_reducer(state, [[RemoveMessage(id=REMOVE_ALL_MESSAGES)]])
+    step2 = _messages_delta_reducer(step1, [[HumanMessage(content="fresh", id="h2")]])
+    assert step2 == result
+
+
+def test_messages_delta_reducer_coerces_message_chunks() -> None:
+    """BaseMessageChunk writes are coerced to full messages."""
+    chunk = AIMessageChunk(content="hello", id="a1")
+    result = _messages_delta_reducer([], [[chunk]])
+    assert len(result) == 1
+    assert not isinstance(result[0], AIMessageChunk)
+    assert result[0].content == "hello"
+    assert result[0].id == "a1"
 
 
 def test_delta_channel_checkpoint_returns_missing() -> None:
