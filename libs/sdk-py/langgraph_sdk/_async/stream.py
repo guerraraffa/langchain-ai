@@ -3,9 +3,10 @@
 `AsyncThreadStream` is an async context manager that owns a
 `ProtocolSseTransport` for one thread, dispatches commands (`run.start`,
 `run.respond`), exposes typed subscriptions over a single shared SSE
-(`subscribe`, `events`), and surfaces lifecycle state (`interrupted`,
-`interrupts`) via an always-on lifecycle watcher SSE. Typed projections
-(`thread.values`, `thread.messages`, etc.) mirror the v3 protocol surface.
+(`subscribe`, `events`), surfaces lifecycle state (`interrupted`,
+`interrupts`) via an always-on lifecycle watcher SSE, and provides typed
+projections (`thread.values`, `thread.messages`, `thread.tool_calls`,
+`thread.extensions`).
 
 Direct port of `libs/sdk/src/client/stream/index.ts`.
 """
@@ -23,6 +24,7 @@ from langchain_core.language_models.chat_model_stream import AsyncChatModelStrea
 from langchain_protocol import Event, SubscribeParams
 
 from langgraph_sdk._async.http import HttpClient
+from langgraph_sdk.schema import QueryParamTypes
 from langgraph_sdk.stream.transport import (
     AsyncProtocolTransport,
     EventStreamHandle,
@@ -58,7 +60,8 @@ class _Subscription:
     # causes a type error with ty; bare asyncio.Queue is accepted.
 
 
-# All public protocol channels used by the raw `events` surface.
+# All public protocol channels used by the raw `events`/`subscribe` surface.
+# Typed projections open narrower channel filters on the shared SSE.
 _ALL_CHANNELS: list[str] = [
     "values",
     "updates",
@@ -88,6 +91,34 @@ def _event_namespace(params_field: Any) -> list[str]:
         return []
     namespace = params_field.get("namespace") or []
     return list(namespace) if isinstance(namespace, list) else []
+
+
+class _AgentModule:
+    """Assistant graph helpers scoped to one thread stream."""
+
+    def __init__(self, owner: AsyncThreadStream) -> None:
+        self._owner = owner
+
+    async def get_tree(
+        self,
+        *,
+        xray: int | bool = False,
+        headers: Mapping[str, str] | None = None,
+        params: QueryParamTypes | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if self._owner._closed:
+            raise RuntimeError("AsyncThreadStream is closed.")
+        query_params: dict[str, Any] = {}
+        if xray:
+            query_params["xray"] = xray
+        if params:
+            query_params.update(dict(params))
+        request_headers = {**self._owner._headers, **dict(headers or {})}
+        return await self._owner._http.get(
+            f"/assistants/{self._owner.assistant_id}/graph",
+            params=query_params,
+            headers=request_headers or None,
+        )
 
 
 class RunModule:
@@ -547,6 +578,7 @@ class ScopedStreamHandle:
         self.tool_calls = _HandleToolCallsProjection(self)
         self.subgraphs = _HandleSubgraphsProjection(self)
         self.subagents = self.subgraphs
+        self.extensions = _ExtensionsProjection(thread, namespace=list(path))
 
     def _push_event(self, event: Event) -> None:
         """Route a descendant event into the appropriate channel inbox.
@@ -1141,6 +1173,68 @@ class _ToolCallsProjection:
             self._thread._unregister_subscription(sub.id)
 
 
+class _ExtensionsProjection:
+    """Mapping from extension name to custom event payload stream.
+
+    Repeated access for the same `name` returns the cached projection so that
+    callers receive the same subscription handle across multiple references to
+    `thread.extensions["foo"]` within one session.
+    """
+
+    def __init__(self, thread: AsyncThreadStream, namespace: list[str]) -> None:
+        self._thread = thread
+        self._namespace = namespace
+        self._cache: dict[str, _ExtensionProjection] = {}
+
+    def __getitem__(self, name: str) -> _ExtensionProjection:
+        if not name:
+            raise ValueError("extension name must be non-empty.")
+        if name not in self._cache:
+            self._cache[name] = _ExtensionProjection(
+                self._thread, name=name, namespace=self._namespace
+            )
+        return self._cache[name]
+
+
+class _ExtensionProjection:
+    def __init__(
+        self,
+        thread: AsyncThreadStream,
+        *,
+        name: str,
+        namespace: list[str],
+    ) -> None:
+        self._thread = thread
+        self._name = name
+        self._namespace = namespace
+
+    def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncGenerator[dict[str, Any], None]:
+        params: SubscribeParams = {"channels": [f"custom:{self._name}"]}
+        if self._namespace:
+            params["namespaces"] = [self._namespace]
+        sub = self._thread._register_subscription(params)
+        try:
+            if self._thread._closed:
+                return
+            await self._thread._reconcile_stream(params)
+            self._thread._ensure_fanout_running()
+            while True:
+                item = await sub.queue.get()
+                if item is None:
+                    return
+                event_params = item.get("params") or {}
+                data = (
+                    event_params.get("data") if isinstance(event_params, dict) else None
+                )
+                if isinstance(data, dict):
+                    yield data
+        finally:
+            self._thread._unregister_subscription(sub.id)
+
+
 class AsyncThreadStream:
     """Async context manager for one thread's v3 streaming session.
 
@@ -1209,12 +1303,14 @@ class AsyncThreadStream:
         # them even after the shared SSE has ended (dedup prevents replay).
         self._root_messages_inbox: asyncio.Queue[Event | None] | None = None
         self.run = RunModule(self)
+        self.agent = _AgentModule(self)
         self.output = _OutputAwaitable(self)
         self.values = _ValuesProjection(self)
         self.messages = _MessagesProjection(self, namespace=[])
         self.tool_calls = _ToolCallsProjection(self, namespace=[])
         self.subgraphs = _SubgraphsProjection(self, scope=())
         self.subagents = self.subgraphs
+        self.extensions = _ExtensionsProjection(self, namespace=[])
 
     @property
     def _controller(self) -> AsyncThreadStream:

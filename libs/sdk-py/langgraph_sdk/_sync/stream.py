@@ -2,9 +2,10 @@
 
 `SyncThreadStream` is a synchronous context manager that owns a
 `SyncProtocolSseTransport` for one thread, dispatches commands (`run.start`,
-`run.respond`), exposes subscriptions over a single shared SSE, and surfaces
-lifecycle state (`interrupted`, `interrupts`) via an always-on lifecycle watcher
-thread.
+`run.respond`), exposes typed subscriptions over a single shared SSE,
+surfaces lifecycle state (`interrupted`, `interrupts`) via an always-on
+lifecycle watcher thread, and provides typed projections (`thread.values`,
+`thread.messages`, `thread.tool_calls`, `thread.extensions`).
 
 Sync mirror of `libs/sdk-py/langgraph_sdk/_async/stream.py`.
 """
@@ -22,6 +23,7 @@ from langchain_core.language_models.chat_model_stream import ChatModelStream
 from langchain_protocol import Event, SubscribeParams
 
 from langgraph_sdk._sync.http import SyncHttpClient
+from langgraph_sdk.schema import QueryParamTypes
 from langgraph_sdk.stream.sync_controller import SyncStreamController, _SyncSubscription
 from langgraph_sdk.stream.transport import (
     SyncEventStreamHandle,
@@ -155,6 +157,34 @@ class _BlockingResult:
 
     def done(self) -> bool:
         return self._event.is_set()
+
+
+class _SyncAgentModule:
+    """Assistant graph helpers scoped to one sync thread stream."""
+
+    def __init__(self, owner: SyncThreadStream) -> None:
+        self._owner = owner
+
+    def get_tree(
+        self,
+        *,
+        xray: int | bool = False,
+        headers: Mapping[str, str] | None = None,
+        params: QueryParamTypes | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if self._owner._closed:
+            raise RuntimeError("SyncThreadStream is closed.")
+        query_params: dict[str, Any] = {}
+        if xray:
+            query_params["xray"] = xray
+        if params:
+            query_params.update(dict(params))
+        request_headers = {**self._owner._headers, **dict(headers or {})}
+        return self._owner._http.get(
+            f"/assistants/{self._owner.assistant_id}/graph",
+            params=query_params,
+            headers=request_headers or None,
+        )
 
 
 class SyncRunModule:
@@ -724,6 +754,7 @@ class SyncScopedStreamHandle:
         self.tool_calls = _SyncHandleToolCallsProjection(self)
         self.subgraphs = _SyncHandleSubgraphsProjection(self)
         self.subagents = self.subgraphs
+        self.extensions = _SyncExtensionsProjection(thread, namespace=list(path))
 
     def _push_event(self, event: Event) -> None:
         """Route a descendant event into the appropriate channel inbox.
@@ -1132,6 +1163,70 @@ class _SyncSubgraphsProjection:
             del active[child_path]
 
 
+class _SyncExtensionsProjection:
+    """Mapping from extension name to custom event payload stream.
+
+    Repeated access for the same `name` returns the cached projection so that
+    callers receive the same subscription handle across multiple references to
+    `thread.extensions["foo"]` within one session.
+    """
+
+    def __init__(self, thread: SyncThreadStream, namespace: list[str]) -> None:
+        self._thread = thread
+        self._namespace = namespace
+        self._cache: dict[str, _SyncExtensionProjection] = {}
+
+    def __getitem__(self, name: str) -> _SyncExtensionProjection:
+        if not name:
+            raise ValueError("extension name must be non-empty.")
+        if name not in self._cache:
+            self._cache[name] = _SyncExtensionProjection(
+                self._thread,
+                name=name,
+                namespace=self._namespace,
+            )
+        return self._cache[name]
+
+
+class _SyncExtensionProjection:
+    def __init__(
+        self,
+        thread: SyncThreadStream,
+        *,
+        name: str,
+        namespace: list[str],
+    ) -> None:
+        self._thread = thread
+        self._name = name
+        self._namespace = namespace
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return self._iter()
+
+    def _iter(self) -> Iterator[dict[str, Any]]:
+        params: SubscribeParams = {"channels": [f"custom:{self._name}"]}
+        if self._namespace:
+            params["namespaces"] = [self._namespace]
+        sub = self._thread._register_subscription(params)
+        try:
+            if self._thread._closed:
+                return
+            self._thread._reconcile_stream(params)
+            self._thread._ensure_fanout_running()
+            while True:
+                item = sub.queue.get()
+                if item is None:
+                    return
+                event_params = item.get("params") or {}
+                data = (
+                    event_params.get("data") if isinstance(event_params, dict) else None
+                )
+                if isinstance(data, dict):
+                    yield data
+        finally:
+            self._thread._unregister_subscription(sub.id)
+
+
 class SyncThreadStream:
     """Synchronous context manager for one thread's v3 streaming session.
 
@@ -1174,11 +1269,13 @@ class SyncThreadStream:
         self._active_tool_calls: set[SyncToolCallHandle] = set()
         self._root_messages_inbox: queue.Queue[Event | None] | None = None
         self.run = SyncRunModule(self)
+        self.agent = _SyncAgentModule(self)
         self.values = _SyncValuesProjection(self)
         self.messages = _SyncMessagesProjection(self, namespace=[])
         self.tool_calls = _SyncToolCallsProjection(self, namespace=[])
         self.subgraphs = _SyncSubgraphsProjection(self, scope=())
         self.subagents = self.subgraphs
+        self.extensions = _SyncExtensionsProjection(self, namespace=[])
 
     def __enter__(self) -> SyncThreadStream:
         if self._closed:
